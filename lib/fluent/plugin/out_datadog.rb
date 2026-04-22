@@ -83,10 +83,24 @@ module Fluent
         end
       end
 
+      SHUTDOWN_TIMEOUT = 10
+
       def shutdown
         @running = false
-        @client&.close
-        super
+        timer  = @timer
+        @timer = nil
+        if timer
+          timer.join(SHUTDOWN_TIMEOUT)
+          if timer.alive?
+            timer.kill
+            timer.join
+          end
+        end
+        @my_mutex.synchronize do
+          super
+          @client&.close
+          @client = nil
+        end
       end
 
       # This method is called when an event reaches Fluentd.
@@ -141,7 +155,8 @@ module Fluent
       def send_to_datadog(events)
         @my_mutex.synchronize do
           events.each do |event|
-            log.trace "Datadog plugin: about to send event=#{event}"
+            event_size = event.respond_to?(:bytesize) ? event.bytesize : event.to_s.bytesize
+            log.trace "Datadog plugin: about to send event (#{event_size} bytes)"
             retries = 0
             begin
               log.info "New attempt to Datadog attempt=#{retries}" if retries > 1
