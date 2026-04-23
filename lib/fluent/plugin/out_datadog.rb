@@ -74,12 +74,17 @@ module Fluent
           else
             context.verify_mode = OpenSSL::SSL::VERIFY_NONE
           end
-          socket              = TCPSocket.new @host, @ssl_port
-          ssl_client          = OpenSSL::SSL::SSLSocket.new socket, context
-          ssl_client.hostname  = @host if ssl_client.respond_to?(:hostname=)
+          socket     = TCPSocket.new @host, @ssl_port
+          ssl_client = OpenSSL::SSL::SSLSocket.new socket, context
+          ssl_client.hostname   = @host if ssl_client.respond_to?(:hostname=)
           ssl_client.sync_close = true
-          ssl_client.connect
-          ssl_client.post_connection_check(@host) if @ssl_verify
+          begin
+            ssl_client.connect
+            ssl_client.post_connection_check(@host) if @ssl_verify
+          rescue StandardError => e
+            ssl_client.close rescue nil
+            raise e
+          end
           ssl_client
         else
           TCPSocket.new @host, @port
@@ -180,7 +185,7 @@ module Fluent
               log.info "New attempt to Datadog attempt=#{retries}" if retries > 1
               @client ||= new_client
               @client.write(event)
-            rescue => e
+            rescue StandardError => e
               @client.close rescue nil
               @client = nil
 
