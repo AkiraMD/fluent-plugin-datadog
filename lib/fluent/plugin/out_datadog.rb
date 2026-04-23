@@ -50,8 +50,8 @@ module Fluent
         compat_parameters_convert(conf, :buffer)
         super
 
-        if @ssl_ca_file && !File.readable?(@ssl_ca_file)
-          raise Fluent::ConfigError, "ssl_ca_file '#{@ssl_ca_file}' does not exist or is not readable"
+        if @ssl_ca_file && !(File.file?(@ssl_ca_file) && File.readable?(@ssl_ca_file))
+          raise Fluent::ConfigError, "ssl_ca_file '#{@ssl_ca_file}' does not exist, is not a regular file, or is not readable"
         end
 
         return if @dd_hostname
