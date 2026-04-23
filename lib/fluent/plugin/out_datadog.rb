@@ -181,34 +181,49 @@ module Fluent
       end
 
       def send_to_datadog(events)
-        @my_mutex.synchronize do
-          events.each do |event|
-            event_size = event.respond_to?(:bytesize) ? event.bytesize : event.to_s.bytesize
-            log.trace "Datadog plugin: about to send event (#{event_size} bytes)"
-            retries = 0
-            begin
-              log.info "New attempt to Datadog attempt=#{retries}" if retries > 1
+        events.each do |event|
+          event_size = event.respond_to?(:bytesize) ? event.bytesize : event.to_s.bytesize
+          log.trace "Datadog plugin: about to send event (#{event_size} bytes)"
+          retries = 0
+          begin
+            client = nil
+            log.info "New attempt to Datadog attempt=#{retries}" if retries > 1
+            # Hold mutex for the write so concurrent callers (e.g. ping thread +
+            # flush thread) don't interleave bytes on the same socket, but
+            # release it before sleeping so shutdown is never blocked.
+            @my_mutex.synchronize do
               @client ||= new_client
-              @client.write(event)
-            rescue StandardError => e
-              @client.close rescue nil
-              @client = nil
-
-              if retries == 0
-                # immediately retry, in case it's just a server-side close
-                retries += 1
-                retry
-              end
-
-              if retries < @max_retries || @max_retries == -1
-                a_couple_of_seconds = [retries ** 2, 30].min
-                retries += 1
-                log.warn "Could not push event to Datadog, attempt=#{retries} max_attempts=#{@max_retries} wait=#{a_couple_of_seconds}s error=#{e}"
-                sleep a_couple_of_seconds
-                retry
-              end
-              raise ConnectionFailure, "Could not push event to Datadog after #{retries} retries, #{e}"
+              client = @client
+              client.write(event)
             end
+          rescue StandardError => e
+            # Only nil @client if it hasn't already been replaced by another
+            # thread that recovered first (identity check via equal?).
+            client_to_close = nil
+            @my_mutex.synchronize do
+              if client && @client.equal?(client)
+                client_to_close = @client
+                @client = nil
+              else
+                client_to_close = client
+              end
+            end
+            client_to_close.close rescue nil
+
+            if retries == 0
+              # immediately retry, in case it's just a server-side close
+              retries += 1
+              retry
+            end
+
+            if retries < @max_retries || @max_retries == -1
+              a_couple_of_seconds = [retries ** 2, 30].min
+              retries += 1
+              log.warn "Could not push event to Datadog, attempt=#{retries} max_attempts=#{@max_retries} wait=#{a_couple_of_seconds}s error=#{e}"
+              sleep a_couple_of_seconds
+              retry
+            end
+            raise ConnectionFailure, "Could not push event to Datadog after #{retries} retries, #{e}"
           end
         end
       end
