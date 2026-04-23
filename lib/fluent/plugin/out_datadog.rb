@@ -49,6 +49,11 @@ module Fluent
       def configure(conf)
         compat_parameters_convert(conf, :buffer)
         super
+
+        if @ssl_ca_file && !File.readable?(@ssl_ca_file)
+          raise Fluent::ConfigError, "ssl_ca_file '#{@ssl_ca_file}' does not exist or is not readable"
+        end
+
         return if @dd_hostname
 
         @dd_hostname = %x[hostname -f 2> /dev/null].strip
