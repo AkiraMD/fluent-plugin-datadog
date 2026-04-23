@@ -7,6 +7,7 @@ require 'socket'
 require 'openssl'
 require 'json'
 require 'time'
+require 'fluent/plugin/output'
 
 module Fluent
   module Plugin
@@ -52,16 +53,25 @@ module Fluent
         @dd_hostname = Socket.gethostname if @dd_hostname.empty?
       end
 
+      def prefer_buffered_processing
+        true
+      end
+
       def multi_workers_ready?
         true
       end
 
       def new_client
         if @use_ssl
-          context    = OpenSSL::SSL::SSLContext.new
-          socket     = TCPSocket.new @host, @ssl_port
-          ssl_client = OpenSSL::SSL::SSLSocket.new socket, context
+          context             = OpenSSL::SSL::SSLContext.new
+          context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+          context.cert_store  = OpenSSL::X509::Store.new.tap { |s| s.set_default_paths }
+          socket              = TCPSocket.new @host, @ssl_port
+          ssl_client          = OpenSSL::SSL::SSLSocket.new socket, context
+          ssl_client.hostname  = @host if ssl_client.respond_to?(:hostname=)
+          ssl_client.sync_close = true
           ssl_client.connect
+          ssl_client.post_connection_check(@host)
           ssl_client
         else
           TCPSocket.new @host, @port
@@ -96,8 +106,8 @@ module Fluent
             timer.join
           end
         end
+        super
         @my_mutex.synchronize do
-          super
           @client&.close
           @client = nil
         end
