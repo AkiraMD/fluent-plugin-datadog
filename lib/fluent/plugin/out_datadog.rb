@@ -88,7 +88,7 @@ module Fluent
             ssl_client.post_connection_check(@host) if @ssl_verify
           rescue StandardError => e
             ssl_client.close rescue nil
-            raise e
+            raise
           end
           ssl_client
         else
