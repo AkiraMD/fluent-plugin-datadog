@@ -32,6 +32,8 @@ module Fluent
       # Connection settings
       config_param :host,           :string,  default: 'intake.logs.datadoghq.com'
       config_param :use_ssl,        :bool,    default: true
+      config_param :ssl_verify,     :bool,    default: true
+      config_param :ssl_ca_file,    :string,  default: nil
       config_param :port,           :integer, default: 10514
       config_param :ssl_port,       :integer, default: 10516
       config_param :max_retries,    :integer, default: -1
@@ -64,14 +66,20 @@ module Fluent
       def new_client
         if @use_ssl
           context             = OpenSSL::SSL::SSLContext.new
-          context.verify_mode = OpenSSL::SSL::VERIFY_PEER
-          context.cert_store  = OpenSSL::X509::Store.new.tap { |s| s.set_default_paths }
+          if @ssl_verify
+            context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+            store = OpenSSL::X509::Store.new
+            @ssl_ca_file ? store.add_file(@ssl_ca_file) : store.set_default_paths
+            context.cert_store = store
+          else
+            context.verify_mode = OpenSSL::SSL::VERIFY_NONE
+          end
           socket              = TCPSocket.new @host, @ssl_port
           ssl_client          = OpenSSL::SSL::SSLSocket.new socket, context
           ssl_client.hostname  = @host if ssl_client.respond_to?(:hostname=)
           ssl_client.sync_close = true
           ssl_client.connect
-          ssl_client.post_connection_check(@host)
+          ssl_client.post_connection_check(@host) if @ssl_verify
           ssl_client
         else
           TCPSocket.new @host, @port
