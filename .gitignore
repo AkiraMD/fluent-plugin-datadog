@@ -40,6 +40,6 @@ foo/
 *.iml
 .idea/
 
-fluent/
+/fluent/
 Gemfile.lock
 .claude/
