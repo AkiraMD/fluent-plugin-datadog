@@ -42,3 +42,4 @@ foo/
 
 fluent/
 Gemfile.lock
+.claude/

@@ -64,6 +64,12 @@ module Fluent
         true
       end
 
+      # #format returns msgpack binary; declare it so Fluentd extends chunks
+      # with ChunkMessagePackEventStreamer, enabling chunk.msgpack_each below.
+      def formatted_to_msgpack_binary?
+        true
+      end
+
       def multi_workers_ready?
         true
       end
@@ -86,7 +92,7 @@ module Fluent
           begin
             ssl_client.connect
             ssl_client.post_connection_check(@host) if @ssl_verify
-          rescue StandardError => e
+          rescue StandardError
             ssl_client.close rescue nil
             raise
           end
@@ -99,13 +105,17 @@ module Fluent
       def start
         super
         @my_mutex = Mutex.new
+        @shutdown_cond = ConditionVariable.new
         @running = true
 
         if @tcp_ping_rate > 0
           @timer = Thread.new do
             while @running
               send_to_datadog(["fp\n"])
-              sleep(@tcp_ping_rate)
+              @my_mutex.synchronize do
+                break unless @running
+                @shutdown_cond.wait(@my_mutex, @tcp_ping_rate)
+              end
             end
           end
         end
@@ -114,9 +124,24 @@ module Fluent
       SHUTDOWN_TIMEOUT = 10
 
       def shutdown
+        # Set the flag without the mutex: if the ping thread is mid-write and
+        # holding @my_mutex, taking it here would block indefinitely and the
+        # join/kill timeout below would never run. Ruby instance-variable
+        # assignment is atomic under the GIL, which is all we need here.
         @running = false
         timer  = @timer
         @timer = nil
+        # Best-effort wake of the ping thread if it's parked in
+        # ConditionVariable#wait (the mutex is released during wait, so
+        # try_lock will succeed). If the mutex is held by a stalled write,
+        # skip — the join/kill path below will handle it.
+        if @my_mutex.try_lock
+          begin
+            @shutdown_cond&.broadcast
+          ensure
+            @my_mutex.unlock
+          end
+        end
         if timer
           timer.join(SHUTDOWN_TIMEOUT)
           if timer.alive?
@@ -125,8 +150,19 @@ module Fluent
           end
         end
         super
-        @my_mutex.synchronize do
-          @client&.close
+        # If we had to kill the ping thread while it held @my_mutex, the
+        # mutex stays locked (Thread#kill doesn't release it). Use try_lock
+        # and fall back to an unlocked close — the only other user is now
+        # dead, so this is safe.
+        if @my_mutex.try_lock
+          begin
+            @client&.close
+            @client = nil
+          ensure
+            @my_mutex.unlock
+          end
+        else
+          @client&.close rescue nil
           @client = nil
         end
       end
