@@ -72,7 +72,9 @@ As fluent-plugin-datadog is an output_buffer, you can set all output_buffer prop
 | **tag_key** | Where to store the Fluentd tag. | "tag" |
 | **timestamp_key** | Name of the attribute which will contain timestamp of the log event. If nil, timestamp attribute is not added. | "@timestamp" |
 | **use_ssl** | If true, the agent initializes a secure connection to Datadog. In clear TCP otherwise. | true |
-| **ssl_port** | Port used to send logs over a SSL encripted connection to Datadog (use 443 for the EU region) | 10516 |
+| **ssl_verify** | If true, the SSL certificate and hostname are verified when connecting. Set to false for environments with TLS-intercepting proxies or self-signed certificates. | true |
+| **ssl_ca_file** | Path to a custom CA bundle file for SSL certificate verification. Uses system default CA paths when not set. | nil |
+| **ssl_port** | Port used to send logs over a SSL encrypted connection to Datadog (use 443 for the EU region) | 10516 |
 | **max_retries** | The number of retries before the output plugin stops. Set to -1 for unlimited retries | -1 |
 | **dd_source** | This tells Datadog what integration it is | nil |
 | **dd_sourcecategory** | Multiple value attribute. Can be used to refine the source attribute | nil |

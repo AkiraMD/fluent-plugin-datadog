@@ -5,219 +5,296 @@
 
 require 'socket'
 require 'openssl'
-require 'yajl'
+require 'json'
+require 'time'
+require 'fluent/plugin/output'
 
-class Fluent::DatadogOutput < Fluent::BufferedOutput
-  class ConnectionFailure < StandardError; end
+module Fluent
+  module Plugin
+    class DatadogOutput < Fluent::Plugin::Output
+      class ConnectionFailure < StandardError; end
 
-  # Register the plugin
-  Fluent::Plugin.register_output('datadog', self)
+      Fluent::Plugin.register_output('datadog', self)
 
-  # Output settings
-  config_param :use_json,           :bool,    :default => true
-  config_param :include_tag_key,    :bool,    :default => false
-  config_param :tag_key,            :string,  :default => 'tag'
-  config_param :timestamp_key,      :string,  :default => '@timestamp'
-  config_param :service,            :string,  :default => nil
-  config_param :dd_sourcecategory,  :string,  :default => nil
-  config_param :dd_source,          :string,  :default => nil
-  config_param :dd_tags,            :string,  :default => nil
-  config_param :dd_hostname,        :string,  :default => nil
+      helpers :compat_parameters
 
-  # Connection settings
-  config_param :host,           :string,  :default => 'intake.logs.datadoghq.com'
-  config_param :use_ssl,        :bool,    :default => true
-  config_param :port,           :integer, :default => 10514
-  config_param :ssl_port,       :integer, :default => 10516
-  config_param :max_retries,    :integer, :default => -1
-  config_param :tcp_ping_rate,  :integer, :default => 10
+      # Output settings
+      config_param :use_json,           :bool,    default: true
+      config_param :include_tag_key,    :bool,    default: false
+      config_param :tag_key,            :string,  default: 'tag'
+      config_param :timestamp_key,      :string,  default: '@timestamp'
+      config_param :service,            :string,  default: nil
+      config_param :dd_sourcecategory,  :string,  default: nil
+      config_param :dd_source,          :string,  default: nil
+      config_param :dd_tags,            :string,  default: nil
+      config_param :dd_hostname,        :string,  default: nil
 
-  # API Settings
-  config_param :api_key,  :string
+      # Connection settings
+      config_param :host,           :string,  default: 'intake.logs.datadoghq.com'
+      config_param :use_ssl,        :bool,    default: true
+      config_param :ssl_verify,     :bool,    default: true
+      config_param :ssl_ca_file,    :string,  default: nil
+      config_param :port,           :integer, default: 10514
+      config_param :ssl_port,       :integer, default: 10516
+      config_param :max_retries,    :integer, default: -1
+      config_param :tcp_ping_rate,  :integer, default: 10
 
-  def initialize
-    super
-  end
+      # API Settings
+      config_param :api_key, :string
 
-  # Define `log` method for v0.10.42 or earlier
-  unless method_defined?(:log)
-    define_method("log") { $log }
-  end
+      config_section :buffer do
+        config_set_default :@type, 'memory'
+      end
 
-  def configure(conf)
-    super
-    return if @dd_hostname
+      def configure(conf)
+        compat_parameters_convert(conf, :buffer)
+        super
 
-    @dd_hostname = %x[hostname -f 2> /dev/null].strip
-    @dd_hostname = Socket.gethostname if @dd_hostname.empty?
-  end
-
-  def multi_workers_ready?
-    true
-  end
-
-  def new_client
-    if @use_ssl
-      context    = OpenSSL::SSL::SSLContext.new
-      socket     = TCPSocket.new @host, @ssl_port
-      ssl_client = OpenSSL::SSL::SSLSocket.new socket, context
-      ssl_client.connect
-      return ssl_client
-    else
-      return TCPSocket.new @host, @port
-    end
-  end
-
-  def start
-    super
-    @my_mutex = Mutex.new
-    @running = true
-
-    if @tcp_ping_rate > 0
-      @timer = Thread.new do
-        while @running do
-          messages = Array.new
-          messages.push("fp\n")
-          send_to_datadog(messages)
-          sleep(@tcp_ping_rate)
+        if @ssl_ca_file && !(File.file?(@ssl_ca_file) && File.readable?(@ssl_ca_file))
+          raise Fluent::ConfigError, "ssl_ca_file '#{@ssl_ca_file}' does not exist, is not a regular file, or is not readable"
         end
-      end
-    end
-  end
 
-  def shutdown
-    super
-    @running = false
-    if @client
-      @client.close
-    end
-  end
+        return if @dd_hostname
 
-  # This method is called when an event reaches Fluentd.
-  def format(tag, time, record)
-    # When Fluent::EventTime is msgpack'ed it gets converted to int with seconds
-    # precision only. We explicitly convert it to floating point number, which
-    # is compatible with Time.at below.
-    return [tag, time.to_f, record].to_msgpack
-  end
-
-  # NOTE! This method is called by internal thread, not Fluentd's main thread.
-  # 'chunk' is a buffer chunk that includes multiple formatted events.
-  def write(chunk)
-    messages = Array.new
-
-    chunk.msgpack_each do |tag, time, record|
-      next unless record.is_a? Hash
-      next if record.empty?
-
-      if @dd_sourcecategory
-        record["ddsourcecategory"] ||= @dd_sourcecategory
-      end
-      if @dd_source
-        record["ddsource"] ||= @dd_source
-      end
-      if @dd_tags
-        record["ddtags"] ||= @dd_tags
-      end
-      if @service
-        record["service"] ||= @service
-      end
-      if @dd_hostname
-        record["hostname"] ||= @dd_hostname
+        @dd_hostname = %x[hostname -f 2> /dev/null].strip
+        @dd_hostname = Socket.gethostname if @dd_hostname.empty?
       end
 
-      if @include_tag_key
-        record[@tag_key] = tag
-      end
-      # If @timestamp_key already exists, we don't overwrite it.
-      if @timestamp_key and record[@timestamp_key].nil? and time
-        record[@timestamp_key] = Time.at(time).utc.iso8601(3)
+      def prefer_buffered_processing
+        true
       end
 
-      container_tags = get_container_tags(record)
-      if not container_tags.empty?
-        if record["ddtags"].nil? || record["ddtags"].empty?
-          record["ddtags"] = container_tags
+      # #format returns msgpack binary; declare it so Fluentd extends chunks
+      # with ChunkMessagePackEventStreamer, enabling chunk.msgpack_each below.
+      def formatted_to_msgpack_binary?
+        true
+      end
+
+      def multi_workers_ready?
+        true
+      end
+
+      def new_client
+        if @use_ssl
+          context             = OpenSSL::SSL::SSLContext.new
+          if @ssl_verify
+            context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+            store = OpenSSL::X509::Store.new
+            @ssl_ca_file ? store.add_file(@ssl_ca_file) : store.set_default_paths
+            context.cert_store = store
+          else
+            context.verify_mode = OpenSSL::SSL::VERIFY_NONE
+          end
+          socket     = TCPSocket.new @host, @ssl_port
+          ssl_client = OpenSSL::SSL::SSLSocket.new socket, context
+          ssl_client.hostname   = @host if ssl_client.respond_to?(:hostname=)
+          ssl_client.sync_close = true
+          begin
+            ssl_client.connect
+            ssl_client.post_connection_check(@host) if @ssl_verify
+          rescue StandardError
+            ssl_client.close rescue nil
+            raise
+          end
+          ssl_client
         else
-          record["ddtags"] = record["ddtags"] + "," + container_tags
+          TCPSocket.new @host, @port
         end
       end
 
-      if @use_json
-        messages.push "#{api_key} " + Yajl.dump(record) + "\n"
-      else
-        next unless record.has_key? "message"
-        messages.push "#{api_key} " + record["message"].strip + "\n"
-      end
-    end
-    send_to_datadog(messages)
-  end
+      def start
+        super
+        @my_mutex = Mutex.new
+        @shutdown_cond = ConditionVariable.new
+        @running = true
 
-  def send_to_datadog(events)
-    @my_mutex.synchronize do
-      events.each do |event|
-        log.trace "Datadog plugin: about to send event=#{event}"
-        retries = 0
-        begin
-          log.info "New attempt to Datadog attempt=#{retries}" if retries > 1
-          @client ||= new_client
-          @client.write(event)
-        rescue => e
-          @client.close rescue nil
+        if @tcp_ping_rate > 0
+          @timer = Thread.new do
+            while @running
+              send_to_datadog(["fp\n"])
+              @my_mutex.synchronize do
+                break unless @running
+                @shutdown_cond.wait(@my_mutex, @tcp_ping_rate)
+              end
+            end
+          end
+        end
+      end
+
+      SHUTDOWN_TIMEOUT = 10
+
+      def shutdown
+        # Set the flag without the mutex: if the ping thread is mid-write and
+        # holding @my_mutex, taking it here would block indefinitely and the
+        # join/kill timeout below would never run. Ruby instance-variable
+        # assignment is atomic under the GIL, which is all we need here.
+        @running = false
+        timer  = @timer
+        @timer = nil
+        # Best-effort wake of the ping thread if it's parked in
+        # ConditionVariable#wait (the mutex is released during wait, so
+        # try_lock will succeed). If the mutex is held by a stalled write,
+        # skip — the join/kill path below will handle it.
+        if @my_mutex.try_lock
+          begin
+            @shutdown_cond&.broadcast
+          ensure
+            @my_mutex.unlock
+          end
+        end
+        if timer
+          timer.join(SHUTDOWN_TIMEOUT)
+          if timer.alive?
+            timer.kill
+            timer.join
+          end
+        end
+        super
+        # If we had to kill the ping thread while it held @my_mutex, the
+        # mutex stays locked (Thread#kill doesn't release it). Use try_lock
+        # and fall back to an unlocked close — the only other user is now
+        # dead, so this is safe.
+        if @my_mutex.try_lock
+          begin
+            @client&.close
+            @client = nil
+          ensure
+            @my_mutex.unlock
+          end
+        else
+          @client&.close rescue nil
           @client = nil
+        end
+      end
 
-          if retries == 0
-            # immediately retry, in case it's just a server-side close
-            retries += 1
-            retry
+      # This method is called when an event reaches Fluentd.
+      def format(tag, time, record)
+        # When Fluent::EventTime is msgpack'ed it gets converted to int with seconds
+        # precision only. We explicitly convert it to floating point number, which
+        # is compatible with Time.at below.
+        [tag, time.to_f, record].to_msgpack
+      end
+
+      # NOTE! This method is called by internal thread, not Fluentd's main thread.
+      # 'chunk' is a buffer chunk that includes multiple formatted events.
+      def write(chunk)
+        messages = []
+
+        chunk.msgpack_each do |tag, time, record|
+          next unless record.is_a?(Hash)
+          next if record.empty?
+
+          record["ddsourcecategory"] ||= @dd_sourcecategory if @dd_sourcecategory
+          record["ddsource"]         ||= @dd_source         if @dd_source
+          record["ddtags"]           ||= @dd_tags           if @dd_tags
+          record["service"]          ||= @service           if @service
+          record["hostname"]         ||= @dd_hostname       if @dd_hostname
+
+          record[@tag_key] = tag if @include_tag_key
+
+          # If @timestamp_key already exists, we don't overwrite it.
+          if @timestamp_key && record[@timestamp_key].nil? && time
+            record[@timestamp_key] = Time.at(time).utc.iso8601(3)
           end
 
-          if retries < @max_retries || @max_retries == -1
-            a_couple_of_seconds = retries ** 2
-            a_couple_of_seconds = 30 unless a_couple_of_seconds < 30
-            retries += 1
-            log.warn "Could not push event to Datadog, attempt=#{retries} max_attempts=#{max_retries} wait=#{a_couple_of_seconds}s error=#{e}"
-            sleep a_couple_of_seconds
-            retry
+          container_tags = get_container_tags(record)
+          unless container_tags.empty?
+            if record["ddtags"].nil? || record["ddtags"].empty?
+              record["ddtags"] = container_tags
+            else
+              record["ddtags"] = record["ddtags"] + "," + container_tags
+            end
           end
-          raise ConnectionFailure, "Could not push event to Datadog after #{retries} retries, #{e}"
+
+          if @use_json
+            messages.push "#{@api_key} " + record.to_json + "\n"
+          else
+            next unless record.key?("message")
+            messages.push "#{@api_key} " + record["message"].strip + "\n"
+          end
+        end
+        send_to_datadog(messages)
+      end
+
+      def send_to_datadog(events)
+        events.each do |event|
+          event_size = event.respond_to?(:bytesize) ? event.bytesize : event.to_s.bytesize
+          log.trace "Datadog plugin: about to send event (#{event_size} bytes)"
+          retries = 0
+          begin
+            client = nil
+            log.info "New attempt to Datadog attempt=#{retries}" if retries > 1
+            # Hold mutex for the write so concurrent callers (e.g. ping thread +
+            # flush thread) don't interleave bytes on the same socket, but
+            # release it before sleeping so shutdown is never blocked.
+            @my_mutex.synchronize do
+              @client ||= new_client
+              client = @client
+              client.write(event)
+            end
+          rescue StandardError => e
+            # Only nil @client if it hasn't already been replaced by another
+            # thread that recovered first (identity check via equal?).
+            client_to_close = nil
+            @my_mutex.synchronize do
+              if client && @client.equal?(client)
+                client_to_close = @client
+                @client = nil
+              else
+                client_to_close = client
+              end
+            end
+            client_to_close.close rescue nil
+
+            if retries == 0
+              # immediately retry, in case it's just a server-side close
+              retries += 1
+              retry
+            end
+
+            if retries < @max_retries || @max_retries == -1
+              a_couple_of_seconds = [retries ** 2, 30].min
+              retries += 1
+              log.warn "Could not push event to Datadog, attempt=#{retries} max_attempts=#{@max_retries} wait=#{a_couple_of_seconds}s error=#{e}"
+              sleep a_couple_of_seconds
+              retry
+            end
+            raise ConnectionFailure, "Could not push event to Datadog after #{retries} retries, #{e}"
+          end
+        end
+      end
+
+      # Collect docker and kubernetes tags for your logs using `filter_kubernetes_metadata` plugin,
+      # for more information about the attribute names, check:
+      # https://github.com/fabric8io/fluent-plugin-kubernetes_metadata_filter/blob/master/lib/fluent/plugin/filter_kubernetes_metadata.rb#L265
+
+      def get_container_tags(record)
+        [
+          get_kubernetes_tags(record),
+          get_docker_tags(record)
+        ].compact.join(",")
+      end
+
+      def get_kubernetes_tags(record)
+        if record.key?('kubernetes') && !record.fetch('kubernetes').nil?
+          kubernetes = record['kubernetes']
+          tags = []
+          tags.push("image_name:" + kubernetes['container_image']) unless kubernetes['container_image'].nil?
+          tags.push("container_name:" + kubernetes['container_name']) unless kubernetes['container_name'].nil?
+          tags.push("kube_namespace:" + kubernetes['namespace_name']) unless kubernetes['namespace_name'].nil?
+          tags.push("pod_name:" + kubernetes['pod_name']) unless kubernetes['pod_name'].nil?
+          tags.join(",")
+        end
+      end
+
+      def get_docker_tags(record)
+        if record.key?('docker') && !record.fetch('docker').nil?
+          docker = record['docker']
+          tags = []
+          tags.push("container_id:" + docker['container_id']) unless docker['container_id'].nil?
+          tags.join(",")
         end
       end
     end
   end
-
-  # Collect docker and kubernetes tags for your logs using `filter_kubernetes_metadata` plugin,
-  # for more information about the attribute names, check:
-  # https://github.com/fabric8io/fluent-plugin-kubernetes_metadata_filter/blob/master/lib/fluent/plugin/filter_kubernetes_metadata.rb#L265
-
-  def get_container_tags(record)
-    return [
-      get_kubernetes_tags(record),
-      get_docker_tags(record)
-    ].compact.join(",")
-  end
-
-  def get_kubernetes_tags(record)
-    if record.key?('kubernetes') and not record.fetch('kubernetes').nil?
-      kubernetes = record['kubernetes']
-      tags = Array.new
-      tags.push("image_name:" + kubernetes['container_image']) unless kubernetes['container_image'].nil?
-      tags.push("container_name:" + kubernetes['container_name']) unless kubernetes['container_name'].nil?
-      tags.push("kube_namespace:" + kubernetes['namespace_name']) unless kubernetes['namespace_name'].nil?
-      tags.push("pod_name:" + kubernetes['pod_name']) unless kubernetes['pod_name'].nil?
-      return tags.join(",")
-    end
-    return nil
-  end
-
-  def get_docker_tags(record)
-    if record.key?('docker') and not record.fetch('docker').nil?
-      docker = record['docker']
-      tags = Array.new
-      tags.push("container_id:" + docker['container_id']) unless docker['container_id'].nil?
-      return tags.join(",")
-    end
-    return nil
-  end
-
 end
