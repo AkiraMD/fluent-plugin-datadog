@@ -1,3 +1,7 @@
+# Archived Repository
+
+This repository has been archived and is no longer maintained.
+
 # Fluentd output plugin for Datadog
 
 It mainly contains a proper JSON formatter and a socket handler that
